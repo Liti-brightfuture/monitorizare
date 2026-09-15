@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="ro">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Monitorizare cameră</title>
+<style>
+  :root {
+    --bg: #12151a; --card: #1b1f27; --line: #2a303b;
+    --text: #e8ecf2; --muted: #8b95a5;
+    --verde: #2ecc71; --galben: #f1c40f; --rosu: #e74c3c; --gri: #7f8c8d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px; background: var(--bg); color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; }
+  h1 { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+
+  .status {
+    background: var(--card); border-radius: 14px; padding: 28px;
+    border-left: 8px solid var(--gri); margin-bottom: 16px;
+  }
+  .status .label { font-size: 34px; font-weight: 700; letter-spacing: -0.5px; }
+  .status .detail { color: var(--muted); margin-top: 6px; font-size: 14px; }
+  .status.verde  { border-left-color: var(--verde); }
+  .status.galben { border-left-color: var(--galben); }
+  .status.rosu   { border-left-color: var(--rosu); }
+  .status.gri    { border-left-color: var(--gri); }
+  .status.rosu .label { color: var(--rosu); }
+  .status.verde .label { color: var(--verde); }
+  .status.galben .label { color: var(--galben); }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .stat { background: var(--card); border-radius: 10px; padding: 14px 16px; }
+  .stat .k { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.4px; }
+  .stat .v { font-size: 22px; font-weight: 600; margin-top: 2px; font-variant-numeric: tabular-nums; }
+
+  .panel { background: var(--card); border-radius: 12px; padding: 18px; margin-bottom: 16px; }
+  .panel h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px;
+              color: var(--muted); margin: 0 0 12px; font-weight: 600; }
+  canvas { width: 100%; height: 130px; display: block; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  td { padding: 7px 4px; border-bottom: 1px solid var(--line); }
+  td:first-child { color: var(--muted); width: 88px; font-variant-numeric: tabular-nums; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; }
+  .empty { color: var(--muted); font-size: 14px; }
+  .warn { color: var(--galben); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Monitorizare cameră</h1>
+  <div class="sub">Detecție de mișcare prin WiFi CSI &middot; fără cameră video, fără brățară</div>
+
+  <div class="status gri" id="status">
+    <div class="label" id="statusLabel">Se conectează…</div>
+    <div class="detail" id="statusDetail">&nbsp;</div>
+  </div>
+
+  <div class="grid">
+    <div class="stat"><div class="k">Scor mișcare</div><div class="v" id="metric">–</div></div>
+    <div class="stat"><div class="k">Pachete / s</div><div class="v" id="rate">–</div></div>
+    <div class="stat"><div class="k">Semnal (RSSI)</div><div class="v" id="rssi">–</div></div>
+  </div>
+
+  <div class="panel">
+    <h2>Ultimele 5 minute</h2>
+    <canvas id="chart"></canvas>
+  </div>
+
+  <div class="panel">
+    <h2>Istoric 24 de ore</h2>
+    <table id="events"><tbody><tr><td colspan="2" class="empty">Se încarcă…</td></tr></tbody></table>
+  </div>
+</div>
+
+<script>
+// Fiecare stare a detectorului -> cum o arătăm. Textul e deliberat despre
+// MIȘCARE, nu despre prezență: metrica nu poate distinge un om nemișcat de o
+// cameră goală.
+const STARI = {
+  CALIBRARE:      { cls: 'gri',    text: 'Se calibrează…',   detalii: 'Se învață nivelul de zgomot al camerei.' },
+  MISCARE:        { cls: 'verde',  text: 'Activitate',       detalii: 'Se detectează mișcare în cameră.' },
+  LINISTE:        { cls: 'galben', text: 'Liniște',          detalii: 'Nicio mișcare detectată momentan.' },
+  INACTIVITATE:   { cls: 'rosu',   text: 'ALERTĂ',           detalii: 'Fără mișcare de prea mult timp.' },
+  SENZOR_OFFLINE: { cls: 'gri',    text: 'Senzor offline',   detalii: 'Nu mai vin date. Verifică plăcile.' },
+};
+const CULORI = { verde: '#2ecc71', galben: '#f1c40f', rosu: '#e74c3c', gri: '#7f8c8d' };
+
+let prag = null;
+let serie = [];            // {ts, metric} pe ultimele 5 minute
+let stareCurenta = null;
+let deLa = Date.now() / 1000;
+
+const $ = id => document.getElementById(id);
+
+function ora(ts) {
+  return new Date(ts * 1000).toLocaleTimeString('ro-RO', { hour12: false });
+}
+
+function durata(sec) {
+  sec = Math.max(0, Math.round(sec));
+  if (sec < 60) return sec + ' s';
+  const m = Math.floor(sec / 60);
+  if (m < 60) return m + ' min';
+  return Math.floor(m / 60) + ' h ' + (m % 60) + ' min';
+}
+
+function actualizeazaDurata() {
+  const info = STARI[stareCurenta];
+  if (!info) return;
+  $('statusDetail').textContent =
+    info.detalii + ' De ' + durata((Date.now() / 1000) - deLa) + '.';
+}
+
+function aplicaStare(s) {
+  const info = STARI[s.state] || { cls: 'gri', text: s.state, detalii: '' };
+  if (s.state !== stareCurenta) { stareCurenta = s.state; deLa = s.ts || Date.now() / 1000; }
+
+  $('status').className = 'status ' + info.cls;
+  $('statusLabel').textContent = info.text;
+  actualizeazaDurata();
+
+  $('metric').textContent = s.metric == null ? '–' : s.metric.toFixed(2);
+  $('rate').textContent = s.pkt_rate ? s.pkt_rate.toFixed(1) : '–';
+  $('rssi').textContent = s.rssi == null ? '–' : s.rssi + ' dBm';
+  if (s.threshold) prag = s.threshold;
+
+  if (s.metric != null && s.ts) {
+    serie.push({ ts: s.ts, metric: s.metric });
+    const limita = s.ts - 300;
+    while (serie.length && serie[0].ts < limita) serie.shift();
+  }
+  deseneaza();
+}
+
+function deseneaza() {
+  const cv = $('chart');
+  const dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  cv.width = w * dpr; cv.height = h * dpr;
+  const ctx = cv.getContext('2d');
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, w, h);
+
+  if (serie.length < 2) {
+    ctx.fillStyle = '#8b95a5'; ctx.font = '13px system-ui';
+    ctx.fillText('Se adună date…', 8, h / 2);
+    return;
+  }
+
+  const vals = serie.map(p => p.metric);
+  const top = Math.max(...vals, prag ? prag * 1.6 : 0) * 1.15 || 1;
+  const t0 = serie[0].ts, t1 = serie[serie.length - 1].ts;
+  const span = Math.max(t1 - t0, 1);
+  const x = ts => ((ts - t0) / span) * (w - 2) + 1;
+  const y = v => h - (v / top) * (h - 6) - 3;
+
+  if (prag) {                                   // linia pragului de mișcare
+    ctx.strokeStyle = 'rgba(241,196,15,0.55)';
+    ctx.setLineDash([4, 4]); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0, y(prag)); ctx.lineTo(w, y(prag)); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  ctx.strokeStyle = CULORI[(STARI[stareCurenta] || {}).cls] || '#7f8c8d';
+  ctx.lineWidth = 1.8; ctx.beginPath();
+  serie.forEach((p, i) => i ? ctx.lineTo(x(p.ts), y(p.metric)) : ctx.moveTo(x(p.ts), y(p.metric)));
+  ctx.stroke();
+}
+
+function randEveniment(e) {
+  const info = STARI[e.to] || { cls: 'gri', text: e.to };
+  const din = e.from ? STARI[e.from] : null;
+  return `<tr><td>${ora(e.ts)}</td><td>` +
+         `<span class="dot" style="background:${CULORI[info.cls]}"></span>` +
+         `${info.text}${din ? ' <span style="color:var(--muted)">(din ' + din.text.toLowerCase() + ')</span>' : ''}` +
+         `</td></tr>`;
+}
+
+async function incarcaIstoric() {
+  try {
+    const r = await fetch('/api/history');
+    const d = await r.json();
+    serie = d.samples || [];
+    const tb = $('events').querySelector('tbody');
+    tb.innerHTML = d.events && d.events.length
+      ? d.events.map(randEveniment).join('')
+      : '<tr><td colspan="2" class="empty">Niciun eveniment încă.</td></tr>';
+    deseneaza();
+  } catch (e) {
+    $('events').querySelector('tbody').innerHTML =
+      '<tr><td colspan="2" class="warn">Nu se poate contacta serverul.</td></tr>';
+  }
+}
+
+const es = new EventSource('/api/stream');
+es.onmessage = ev => {
+  const s = JSON.parse(ev.data);
+  const eraStarea = stareCurenta;
+  aplicaStare(s);
+  if (eraStarea !== null && eraStarea !== stareCurenta) incarcaIstoric();
+};
+es.onerror = () => {
+  $('status').className = 'status gri';
+  $('statusLabel').textContent = 'Deconectat';
+  $('statusDetail').textContent = 'Serverul nu răspunde. Reîncercare automată…';
+};
+
+incarcaIstoric();
+setInterval(incarcaIstoric, 60000);
+// ține actualizat textul "De N minute" chiar și când nu vin date noi
+setInterval(actualizeazaDurata, 1000);
+window.addEventListener('resize', deseneaza);
+</script>
+</body>
+</html>
