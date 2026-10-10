@@ -350,6 +350,101 @@ class MotionDetector:
         span = self._rate_buf[-1] - self._rate_buf[0]
         return (len(self._rate_buf) - 1) / span if span > 0 else 0.0
 
+    @property
+    def last_packet_t(self):
+        return self._last_packet_t
+
+
+class MultiMotionDetector:
+    """Combina mai multe receptoare independente intr-o singura stare, luand
+    maximul scorurilor lor -- daca oricare receptor vede miscare, sistemul e
+    in MISCARE. Asta e diversitatea spatiala ceruta de literatura (Wi-Sleep):
+    un receptor poate avea un punct orb pe care celalalt il acopera.
+
+    Fiecare receptor ruleaza propriul MotionDetector (warmup, subpurtatoare,
+    mediere) pe fluxul lui de pachete. Combinarea se face INAINTE de
+    histerezis, pe scorurile brute (csi_dist/rssi_std recalculate ca enter/
+    exit), intr-o SINGURA masina de stari -- nu tinem cate o masina de stari
+    per receptor, fiindca fiecare are propriul ei motion_hold_sec si combinarea
+    a doua stari deja filtrate ar introduce intarzieri greu de rationat.
+
+    Un receptor cazut (fara pachete de peste cfg.offline_sec) e exclus din
+    combinare, nu tinut la ultimul scor cunoscut. Starea e SENZOR_OFFLINE doar
+    daca TOATE receptoarele sunt cazute -- unul singur cazut inseamna
+    monitorizare degradata, nu oarba.
+    """
+
+    def __init__(self, sensor_ids, cfg=None):
+        self.cfg = cfg or Config()
+        self._sensors = {sid: MotionDetector(self.cfg) for sid in sensor_ids}
+        self._scores = {}   # sid -> (csi_dist, rssi_std, rssi, pkt_rate)
+        self._sm = StateMachine(self.cfg)
+
+    @property
+    def state(self):
+        return self._sm.state
+
+    def _online(self, sid, now):
+        det = self._sensors[sid]
+        return (det.last_packet_t is not None
+                and now - det.last_packet_t <= self.cfg.offline_sec)
+
+    def feed(self, sensor_id, pkt):
+        det = self._sensors[sensor_id]
+        result = det.feed(pkt)
+        if result is not None:
+            upd, _ = result
+            if upd.metric is not None:
+                self._scores[sensor_id] = (upd.csi_dist, upd.rssi_std, upd.rssi, upd.pkt_rate)
+        return self._combine(pkt.t)
+
+    def tick(self, now):
+        return self._combine(now)
+
+    def _combine(self, now):
+        cfg = self.cfg
+        online = [sid for sid in self._sensors if self._online(sid, now)]
+        per_sensor = {}
+        if not online:
+            for sid in self._sensors:
+                per_sensor[sid] = dict(metric=None, rssi=None, pkt_rate=0.0, online=False)
+            return self._transition(now, SENZOR_OFFLINE, per_sensor)
+
+        enters, exits = [], []
+        for sid in online:
+            last = self._scores.get(sid)
+            if last is None:
+                per_sensor[sid] = dict(metric=None, rssi=None, pkt_rate=0.0, online=True)
+                continue
+            csi_dist, rssi_std, rssi, pkt_rate = last
+            enter = max(csi_dist / max(cfg.csi_threshold, 1e-9),
+                       rssi_std / max(cfg.rssi_threshold, 1e-9))
+            exit_ = max(csi_dist / max(cfg.csi_exit, 1e-9),
+                       rssi_std / max(cfg.rssi_exit, 1e-9))
+            enters.append(enter)
+            exits.append(exit_)
+            per_sensor[sid] = dict(metric=enter, rssi=rssi, pkt_rate=pkt_rate, online=True)
+        for sid in self._sensors:
+            if sid not in online:
+                per_sensor[sid] = dict(metric=None, rssi=None, pkt_rate=0.0, online=False)
+
+        if not enters:
+            return None  # niciun receptor a terminat inca warmup-ul
+
+        enter, exit_ = max(enters), max(exits)
+        state, changed = self._sm.step(now, enter, exit_)
+        pkt_rate = sum(v['pkt_rate'] for v in per_sensor.values())
+        rssi = max((v['rssi'] for v in per_sensor.values() if v['rssi'] is not None),
+                  default=None)
+        upd = Update(now, enter, state, pkt_rate, rssi, None, None)
+        return upd, changed, per_sensor
+
+    def _transition(self, now, state, per_sensor):
+        changed = state != self._sm.state
+        self._sm.state = state
+        upd = Update(now, None, state, 0.0, None, None, None)
+        return upd, changed, per_sensor
+
 
 class Store:
     """Istoric pe disc: tranzitiile de stare si metrica esantionata."""

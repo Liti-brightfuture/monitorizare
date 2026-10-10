@@ -1,6 +1,7 @@
 """Dashboard local: citeste serial, ruleaza detectorul, serveste o pagina web.
 
-    python server.py --port COM5                 # live, de la placa receptoare
+    python server.py --port COM5                 # live, un singur receptor
+    python server.py --port COM5 COM6             # live, doua receptoare (max scoruri)
     python server.py --replay data/miscare_*.csv # fara placi, dintr-o inregistrare
 
 Totul ruleaza pe laptop: fara internet, fara cont, fara cloud. Deschide
@@ -24,7 +25,7 @@ ROOT = Path(__file__).parent
 _clients = set()
 _clients_lock = threading.Lock()
 _latest = {'state': detector.CALIBRARE, 'metric': None, 'pkt_rate': 0.0,
-           'rssi': None, 'ts': 0.0, 'threshold': None}
+           'rssi': None, 'ts': 0.0, 'threshold': None, 'sensors': {}}
 _det_lock = threading.Lock()
 
 
@@ -58,17 +59,17 @@ def replay_source(pattern):
     print('Inregistrarea s-a terminat.')
 
 
-def reader_thread(source, det, store):
+def reader_thread(source, sensor_id, det, store):
     prev = det.state
     for pkt in source:
         if pkt is None:
             continue  # inactivitate pe port; offline_thread se ocupa de ea
         with _det_lock:
-            result = det.feed(pkt)
+            result = det.feed(sensor_id, pkt)
         if result is None:
             continue
-        upd, changed = result
-        _publish(upd, changed, prev, store)
+        upd, changed, per_sensor = result
+        _publish(upd, changed, prev, per_sensor, store)
         prev = upd.state
 
 
@@ -83,19 +84,22 @@ def offline_thread(det, store):
         if result is None:
             prev = det.state
             continue
-        upd, changed = result
-        _publish(upd, changed, prev, store)
+        upd, changed, per_sensor = result
+        _publish(upd, changed, prev, per_sensor, store)
         prev = upd.state
 
 
-def _publish(upd, changed, prev, store):
+def _publish(upd, changed, prev, per_sensor, store):
     _latest.update(state=upd.state, metric=upd.metric, pkt_rate=upd.pkt_rate,
-                   rssi=upd.rssi, ts=upd.t)
+                   rssi=upd.rssi, ts=upd.t, sensors=per_sensor)
     store.sample(upd)
     if changed:
         store.event(upd.t, prev, upd.state)
+        offline = [sid for sid, s in per_sensor.items() if not s['online']]
+        suffix = f'  (offline: {", ".join(offline)})' if offline else ''
         print(f'{time.strftime("%H:%M:%S")}  {prev} -> {upd.state}'
-              f'  (metrica {upd.metric if upd.metric is not None else float("nan"):.4f})')
+              f'  (metrica {upd.metric if upd.metric is not None else float("nan"):.4f})'
+              f'{suffix}')
     broadcast(dict(_latest))
 
 
@@ -158,8 +162,11 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     ap = argparse.ArgumentParser(description='Dashboard local de monitorizare.')
     src = ap.add_mutually_exclusive_group(required=True)
-    src.add_argument('--port', help='portul serial al placii receptoare, ex. COM5')
-    src.add_argument('--replay', help='reda o inregistrare din data/ in loc de serial')
+    src.add_argument('--port', nargs='+',
+                     help='portul (sau porturile) serial ale placilor receptoare, '
+                          'ex. --port COM5 COM6 pentru diversitate spatiala')
+    src.add_argument('--replay', nargs='+',
+                     help='reda una sau mai multe inregistrari din data/ in loc de serial')
     ap.add_argument('--http-port', type=int, default=8000)
     ap.add_argument('--alert-after', type=float,
                     help='secunde de liniste pana la alerta (implicit 300)')
@@ -176,14 +183,20 @@ def main():
           f'RSSI: {cfg.rssi_threshold:.3f} / {cfg.rssi_exit:.3f}')
     print(f'Alerta dupa {cfg.quiet_to_alert_sec:.0f}s de liniste')
 
+    sources = args.replay if args.replay else args.port
+    if len(sources) > 1:
+        print(f'{len(sources)} receptoare: {", ".join(sources)} (starea combinata = maximul scorurilor)')
+
     store = detector.Store()
-    det = detector.MotionDetector(cfg)
+    det = detector.MultiMotionDetector(sources, cfg)
     Handler.store = store
     # Metrica raportata e scorul normalizat, deci pragul e mereu 1.0.
     _latest['threshold'] = 1.0
 
-    source = replay_source(args.replay) if args.replay else csi_capture.iter_serial(args.port)
-    threading.Thread(target=reader_thread, args=(source, det, store), daemon=True).start()
+    for sensor_id in sources:
+        source = replay_source(sensor_id) if args.replay else csi_capture.iter_serial(sensor_id)
+        threading.Thread(target=reader_thread, args=(source, sensor_id, det, store),
+                         daemon=True).start()
     threading.Thread(target=offline_thread, args=(det, store), daemon=True).start()
 
     httpd = ThreadingHTTPServer(('127.0.0.1', args.http_port), Handler)
